@@ -1,4 +1,4 @@
-# Habitide— daily habits & tasks
+# Habitude — daily habits & tasks
 
 A habit tracker and to-do list that earns you coins, multiplies them for streaks, and lets each kind of day have its own look. It runs entirely in your browser (or as a home-screen app), and your data lives in **your own** Google Sheet. Anyone who opens the GitHub Pages link gets their own separate, empty copy — nobody can see anyone else's data.
 
@@ -6,17 +6,17 @@ A habit tracker and to-do list that earns you coins, multiplies them for streaks
 
 ## 1. Put the app on GitHub Pages (about 3 minutes)
 
-1. On GitHub, create a new **public** repository, e.g. `habiterrium`.
+1. On GitHub, create a new **public** repository, e.g. `habitude`.
 2. Click **Add file → Upload files** and drag in everything from this folder **except** the `apps-script` folder (it doesn't hurt to include it). Keep the `icons` folder as a folder.
 3. Commit.
 4. Go to **Settings → Pages**. Under *Build and deployment*, choose **Deploy from a branch**, branch **main**, folder **/ (root)**, then **Save**.
-5. After a minute your app is live at `https://YOUR-USERNAME.github.io/habiterrium/`.
+5. After a minute your app is live at `https://YOUR-USERNAME.github.io/habitude/`.
 
 The app works immediately — everything saves in that browser. Steps 2–3 add your Google Sheet.
 
 ## 2. Create your Google Sheet backend (about 5 minutes)
 
-1. Create a new, blank Google Sheet (name it anything, e.g. *Habiterrium data*).
+1. Create a new, blank Google Sheet (name it anything, e.g. *Habitude data*).
 2. In the sheet: **Extensions → Apps Script**. Delete the sample code and paste in everything from `apps-script/Code.gs`.
 3. On the line `const APP_KEY = 'CHANGE-ME-to-a-long-secret-phrase';` replace the text between the quotes with your own long secret phrase. Save (💾).
 4. In the function dropdown at the top choose **setup** and click **Run**. Approve the permissions (Google will warn that the app isn't verified — that's because it's *your* script; choose *Advanced → Go to project*). This creates the tabs and a small **Dashboard** tab.

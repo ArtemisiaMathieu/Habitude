@@ -637,7 +637,8 @@ function pageSettings() {
   <section id="sheets"><div class="sec-head"><h2>Google Sheets sync</h2></div><div class="card stack">
     <label class="f"><span>Apps Script web app URL</span><input type="url" data-ch="localSet" data-k="scriptUrl" data-fk="scriptUrl" value="${esc(L.scriptUrl)}" placeholder="https://script.google.com/macros/s/…/exec"></label>
     <label class="f"><span>App key (the APP_KEY you set in the script)</span><input type="password" data-ch="localSet" data-k="appKey" data-fk="appKey" value="${esc(L.appKey)}" autocomplete="off"></label>
-    <div class="row"><button class="btn sm" data-act="testConnection">Test & sync now</button>${L.lastSync ? `<span class="muted tiny">Last synced ${esc(new Date(L.lastSync).toLocaleString())}</span>` : ''}</div>
+    <div class="row"><button class="btn sm" data-act="testConnection">Test & sync now</button>${L.scriptUrl && L.appKey ? `<button class="btn sm ghost" data-act="copySetupCode">Copy setup code</button>` : ''}${L.lastSync ? `<span class="muted tiny">Last synced ${esc(new Date(L.lastSync).toLocaleString())}</span>` : ''}</div>
+    <div class="help"><b>Adding another device or a home-screen icon?</b> Tap <i>Copy setup code</i> here, open the new copy of the app, choose <i>Connect to my Google Sheet</i>, and paste. On iPhone the home-screen app keeps its own storage, separate from Safari, so it needs this once.</div>
     <div class="help">Your data always saves in this browser first. Once connected, every change is copied to your own Google Sheet, so you can use the app on your phone and computer and keep a permanent record. The README explains the 5-minute setup.</div></div></section>
 
   <section><div class="sec-head"><h2>AI skin designer <span class="muted small">(optional)</span></h2></div><div class="card stack">
@@ -831,6 +832,14 @@ async function pullRemote({ force = false, announce = false } = {}) {
   try {
     const j = await api('load'); const remote = j.data && j.data.Meta ? fromSheets(j.data) : null;
     if (!remote) { await pushRemote(); if (announce) toast('Connected — your sheet is set up.'); return; }
+    // First time this device connects to a sheet that already has data: ask, never overwrite silently.
+    if (!L.lastSync && !S.meta.updatedAt) { S = normalize(remote); saveState(); _scKey = ''; L.lastSync = Date.now(); saveLocal(); setSync('synced'); closeModal(); render(); toast('Connected — your habits and tasks are loaded.'); return; }
+    if (!L.lastSync && remote.meta.updatedAt !== S.meta.updatedAt) {
+      const takeSheet = confirm(`Your Google Sheet already has data (${remote.habits.length} habits, ${remote.tasks.length} tasks, ${Object.keys(remote.days).length} days logged).\n\nOK = load the sheet's data onto this device (replaces what's here).\nCancel = keep this device's data and overwrite the sheet.`);
+      if (takeSheet) { S = normalize(remote); saveState(); _scKey = ''; L.lastSync = Date.now(); saveLocal(); setSync('synced'); closeModal(); render(); toast('Loaded your data from Google Sheets.'); }
+      else { await pushRemote(); toast('This device’s data is now in your sheet.'); }
+      return;
+    }
     if (remote.meta.updatedAt > S.meta.updatedAt) { S = normalize(remote); saveState(); L.lastSync = Date.now(); saveLocal(); setSync('synced'); render(); toast('Loaded your latest data from Google Sheets.'); }
     else if (remote.meta.updatedAt < S.meta.updatedAt) await pushRemote();
     else { L.lastSync = Date.now(); saveLocal(); setSync('synced'); if (announce) toast('Connected — everything is up to date.'); }
@@ -938,6 +947,11 @@ const ACT = {
   restore: () => $('#fileBackup').click(),
   resetAll: () => { if (!confirm('Erase all habits, tasks, templates and history on this device?')) return; if (!confirm('Really erase everything? (Your Google Sheet keeps its copy until the next sync.)')) return;
     S = defaultState(); saveState(); _scKey = ''; V.date = todayStr(); render(); openModal(welcomeModal); },
+  openConnect: () => openModal(connectModal),
+  backToWelcome: () => openModal(welcomeModal),
+  copySetupCode: async () => { const code = 'HBT1:' + btoa(unescape(encodeURIComponent(JSON.stringify({ u: L.scriptUrl, k: L.appKey }))));
+    try { await navigator.clipboard.writeText(code); toast('Setup code copied — paste it into the other copy of the app.', 3500); }
+    catch { prompt('Copy this setup code:', code); } },
   seedExample: () => { S = exampleState(); S.meta.updatedAt = Date.now(); saveState(); scheduleSync(); closeModal(); render(); },
   startBlank: () => { closeModal(); S.meta.updatedAt = Date.now(); saveState(); render(); },
   expAll: el => { const v = el.dataset.v === '1'; DATASETS.forEach(([id]) => exportModal.st.ids[id] = v); rerenderModal(); },
@@ -951,7 +965,7 @@ const CH = {
   taskGroup: el => { V.taskGroup = el.value; render(); },
   q: el => { V.q[el.dataset.k] = el.value; render(); },
   setting: el => commit(s => { s.settings[el.dataset.k] = +el.value; }),
-  localSet: el => { L[el.dataset.k] = el.value.trim(); saveLocal(); updateSyncUI(); if (el.dataset.k === 'scriptUrl' && L.scriptUrl && L.appKey) pullRemote({ force: true, announce: true }); },
+  localSet: el => { L[el.dataset.k] = el.value.trim(); if (el.dataset.k !== 'claudeKey') L.lastSync = 0; saveLocal(); queueRender(); if (el.dataset.k === 'scriptUrl' && L.scriptUrl && L.appKey) pullRemote({ force: true, announce: true }); },
   tplField: el => commit(s => { const t = s.templates.find(x => x.id === el.dataset.id); t[el.dataset.k] = el.dataset.k === 'name' ? (el.value.trim() || 'Untitled day') : el.value; }),
   tplToggle: el => commit(s => { const t = s.templates.find(x => x.id === el.dataset.id); t[el.dataset.k] = el.checked; }),
   habitField: el => commit(s => { const h = s.habits.find(x => x.id === el.dataset.id); h[el.dataset.k] = el.dataset.k === 'name' ? (el.value.trim() || 'Untitled habit') : el.value; }),
@@ -967,6 +981,10 @@ const CH = {
 };
 const IN = { skinField: el => { if (skinDraft) skinDraft[el.dataset.k] = el.value; } };
 const SUB = {
+  connectSheet: f => { const fromCode = parseSetupCode(f.code.value); const url = fromCode ? fromCode.u : f.url.value.trim(); const key = fromCode ? fromCode.k : f.key.value.trim();
+    if (f.code.value.trim() && !fromCode) return toast("That setup code doesn't look right — try copying it again.");
+    if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(url) || !key) return toast('Paste a setup code, or both the web app URL and key.');
+    L.scriptUrl = url; L.appKey = key; L.lastSync = 0; saveLocal(); toast('Connecting…'); pullRemote({ force: true, announce: true }); },
   quickTask: f => { const title = f.title.value.trim(); if (!title) return; const coins = +f.coins.value; const id = uid('tk');
     commit(s => { s.tasks.push({ id, title, groupId: '', due: '', priority: 2, notes: '', status: 'open', createdAt: Date.now(), closedAt: '' }); ensureDay(s, V.date).tasks.push({ taskId: id, coins, done: false }); }); },
   newTask: f => { const fd = new FormData(f); const title = String(fd.get('title')).trim(); if (!title) return;
@@ -1010,11 +1028,25 @@ function applySkinModal(id) {
     <div class="set-row">${swatch(sk)}<div class="grow"><b>Default skin</b><div class="muted tiny">Used by any template without its own skin</div></div>${S.settings.defaultSkinId === id ? '<span class="badge-on">In use</span>' : `<button class="btn sm" data-act="setDefaultSkin" data-id="${id}">Use as default</button>`}</div>
     <div><div style="margin:4px 0;font-size:13px;font-weight:600;color:var(--muted)">Use for these kinds of day</div>${S.templates.map(t => `<label class="check-row"><input type="checkbox" data-act="skinTplToggle" data-id="${id}" data-t="${t.id}" ${t.skinId === id ? 'checked' : ''}> ${esc(t.name)}</label>`).join('') || '<p class="muted small">Create a day template first.</p>'}</div></div>`;
 }
+function connectModal() {
+  return `${modalHead('Connect to my Google Sheet')}<form class="stack" data-submit="connectSheet">
+    <p class="small">Already using Habitude on another device or in your browser? In that copy go to <b>Settings → Google Sheets sync → Copy setup code</b>, then paste it here.</p>
+    <label class="f"><span>Setup code</span><textarea name="code" placeholder="HBT1:…" style="min-height:64px" autocomplete="off"></textarea></label>
+    <details><summary class="small muted" style="cursor:pointer">Or enter the web app URL and key yourself</summary><div class="stack" style="margin-top:10px">
+      <label class="f"><span>Apps Script web app URL</span><input type="url" name="url" placeholder="https://script.google.com/macros/s/…/exec"></label>
+      <label class="f"><span>App key</span><input type="password" name="key" autocomplete="off"></label></div></details>
+    <button class="btn block" type="submit">Connect & load my data</button>
+    <button class="btn ghost block" type="button" data-act="backToWelcome">Back</button></form>`;
+}
+function parseSetupCode(code) {
+  const m = String(code || '').trim().match(/HBT1:([A-Za-z0-9+/=_-]+)/); if (!m) return null;
+  try { const o = JSON.parse(decodeURIComponent(escape(atob(m[1].replace(/-/g, '+').replace(/_/g, '/'))))); return o && o.u && o.k ? o : null; } catch { return null; }
+}
 function welcomeModal() {
   return `<div class="stack" style="padding:6px 2px"><div class="brand" style="font-size:28px"><span class="brand-mark"></span>Habitude</div>
     <p>Track your habits and tasks, earn coins, and build streaks that multiply your rewards.</p>
     <p class="muted small">Everything you enter stays in this browser. When you're ready, connect your own Google Sheet in Settings to keep a permanent copy and sync across devices.</p>
-    <button class="btn block" data-act="seedExample">Start with an example setup</button><button class="btn ghost block" data-act="startBlank">Start with a blank slate</button>
+    <button class="btn block" data-act="seedExample">Start with an example setup</button><button class="btn ghost block" data-act="startBlank">Start with a blank slate</button><button class="btn soft block" data-act="openConnect">Connect to my Google Sheet</button>
     <p class="help center" style="margin:0">The example includes three kinds of day, a few habits and tasks — edit or delete any of it.</p></div>`;
 }
 function exampleState() {
@@ -1065,5 +1097,6 @@ const PAGES = { day: pageDay, tasks: pageTasks, progress: pageProgress, settings
 render();
 if (FIRST_RUN) openModal(welcomeModal);
 pullRemote({ force: true });
+try { navigator.storage?.persist?.(); } catch {}
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 let _rw = window.innerWidth; window.addEventListener('resize', () => { if (Math.abs(window.innerWidth - _rw) > 60 && V.page === 'progress') { _rw = window.innerWidth; render(); } });

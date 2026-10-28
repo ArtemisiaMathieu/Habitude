@@ -1,4 +1,4 @@
-# Habiterrium — daily habits & tasks
+# Habitide— daily habits & tasks
 
 A habit tracker and to-do list that earns you coins, multiplies them for streaks, and lets each kind of day have its own look. It runs entirely in your browser (or as a home-screen app), and your data lives in **your own** Google Sheet. Anyone who opens the GitHub Pages link gets their own separate, empty copy — nobody can see anyone else's data.
 

@@ -809,41 +809,125 @@ Text must be very readable on bg and surface (contrast 7:1 or better); accent mu
 /* =====================================================================
    GOOGLE SHEETS SYNC
    ===================================================================== */
-let syncTimer = null, syncState = 'local', lastPull = 0;
+let syncTimer = null, syncState = 'local', lastPull = 0, syncBusy = false, syncHold = false;
+/* How sync stays safe:
+   - L.remoteAt = the sheet's version (Meta.updatedAt) this device last saw. L.dirty = this device has unsaved edits.
+   - Saves send baseAt; the sheet refuses them if another device saved in between, and the two copies are merged.
+   - An empty or clearly smaller copy never silently replaces a fuller one: the app asks, with "combine both" as the safe choice. */
 function updateSyncUI() {
   const b = $('#syncBtn'); if (!b) return;
   const st = !L.scriptUrl ? 'local' : syncState; b.dataset.s = st;
-  $('#syncLabel').textContent = { local: 'On this device', pending: 'Saving…', saving: 'Saving…', synced: 'Synced', error: 'Sync problem', pulling: 'Checking…' }[st] || 'Synced';
+  $('#syncLabel').textContent = { local: 'On this device', pending: 'Saving…', saving: 'Saving…', synced: 'Synced', error: 'Sync problem', pulling: 'Checking…', waiting: 'Needs your choice' }[st] || 'Synced';
 }
 function setSync(s) { syncState = s; updateSyncUI(); }
-function scheduleSync() { if (!L.scriptUrl) return; setSync('pending'); clearTimeout(syncTimer); syncTimer = setTimeout(pushRemote, 2200); }
+function scheduleSync() { if (!L.scriptUrl) return; L.dirty = true; saveLocal(); if (syncHold) return; setSync('pending'); clearTimeout(syncTimer); syncTimer = setTimeout(() => pushRemote(), 2200); }
 async function api(action, extra = {}) {
   const res = await fetch(L.scriptUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action, key: L.appKey, ...extra }), redirect: 'follow' });
   if (!res.ok) throw new Error('HTTP ' + res.status);
-  const j = await res.json(); if (!j.ok) throw new Error(j.error || 'Request failed'); return j;
+  const j = await res.json(); if (j.v && L.serverV !== j.v) { L.serverV = j.v; saveLocal(); } if (!j.ok) { const e = new Error(j.error || 'Request failed'); e.conflict = !!j.conflict; e.refusedEmpty = !!j.refusedEmpty; throw e; } return j;
 }
-async function pushRemote() {
-  if (!L.scriptUrl) return; clearTimeout(syncTimer); setSync('saving');
-  try { await api('save', { data: toSheets() }); L.lastSync = Date.now(); saveLocal(); setSync('synced'); }
-  catch (e) { console.warn(e); setSync('error'); }
+const dayCount = s => Object.values(s.days).filter(d => d.templateId || Object.keys(d.habits).length || d.tasks.length).length;
+const isEmptyState = s => !s.habits.length && !s.tasks.length && !s.templates.length && !dayCount(s);
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const sizeOf = s => `${plural(s.habits.length, 'habit')}, ${plural(s.tasks.length, 'task')}, ${plural(dayCount(s), 'day')} logged`;
+// Would taking `remote` lose things this device has? (days are never deleted, so fewer days = something went wrong)
+function remoteLooksSmaller(remote) {
+  if (isEmptyState(S)) return false;
+  if (dayCount(remote) < dayCount(S)) return true;
+  const n = x => x.habits.length + x.tasks.length + x.templates.length;
+  return n(remote) < n(S) * 0.6;
+}
+function mergeStates(local, remote) {
+  const out = normalize(JSON.parse(JSON.stringify(remote)));
+  for (const k of ['categories', 'habits', 'templates', 'skins', 'taskGroups', 'tasks']) {
+    const byId = new Map(out[k].map(x => [x.id, x]));
+    for (const x of local[k]) byId.set(x.id, JSON.parse(JSON.stringify(x)));
+    const order = [...local[k].map(x => x.id), ...out[k].map(x => x.id).filter(id => !local[k].some(y => y.id === id))];
+    out[k] = order.map(id => byId.get(id)).filter(Boolean);
+  }
+  for (const [date, ld] of Object.entries(local.days)) {
+    const rd = out.days[date];
+    if (!rd) { out.days[date] = JSON.parse(JSON.stringify(ld)); continue; }
+    rd.templateId = ld.templateId || rd.templateId;
+    if (Array.isArray(ld.habitIds)) rd.habitIds = ld.habitIds.slice();
+    rd.habits = { ...rd.habits, ...ld.habits };
+    const tasks = new Map(rd.tasks.map(t => [t.taskId, t])); for (const t of ld.tasks) { const r = tasks.get(t.taskId); tasks.set(t.taskId, r ? { ...t, done: t.done || r.done } : { ...t }); }
+    rd.tasks = [...tasks.values()];
+  }
+  out.settings = { ...remote.settings, ...local.settings };
+  return out;
+}
+function adoptState(next, msg) {
+  S = normalize(next); saveState(); _scKey = ''; L.remoteAt = S.meta.updatedAt; L.dirty = false; L.lastSync = Date.now(); saveLocal();
+  setSync('synced'); render(); if (msg) toast(msg);
+}
+async function pushRemote({ force = false, retried = false } = {}) {
+  if (!L.scriptUrl || syncHold) return; clearTimeout(syncTimer);
+  if (isEmptyState(S) && !force) { L.dirty = false; saveLocal(); setSync('synced'); return; } // never save "nothing" over a sheet
+  setSync('saving');
+  try {
+    // An older backend script can't detect conflicts, so check the sheet ourselves first.
+    if (L.serverV !== 2 && !force && typeof L.remoteAt === 'number') {
+      const j = await api('load'); const r = j.data && j.data.Meta ? fromSheets(j.data) : null;
+      if (r && !isEmptyState(r) && r.meta.updatedAt !== L.remoteAt) { S = mergeStates(S, r); S.meta.updatedAt = Date.now(); saveState(); _scKey = ''; L.remoteAt = r.meta.updatedAt; saveLocal(); render(); }
+    }
+    const sentAt = S.meta.updatedAt;
+    await api('save', { data: toSheets(), baseAt: typeof L.remoteAt === 'number' ? L.remoteAt : null, force });
+    L.remoteAt = sentAt; L.lastSync = Date.now(); if (S.meta.updatedAt === sentAt) L.dirty = false; saveLocal(); setSync(L.dirty ? 'pending' : 'synced');
+    if (L.dirty) scheduleSync();
+  } catch (e) {
+    console.warn(e);
+    if (e.conflict && !retried) { lastPull = 0; return pullRemote({ force: true }); }   // someone else saved first → merge, then save
+    if (e.refusedEmpty) { setSync('synced'); return; }
+    setSync('error');
+  }
 }
 async function pullRemote({ force = false, announce = false } = {}) {
-  if (!L.scriptUrl || (!force && Date.now() - lastPull < 30000)) return; lastPull = Date.now(); setSync('pulling');
+  if (!L.scriptUrl || syncHold || syncBusy || (!force && Date.now() - lastPull < 30000)) return;
+  lastPull = Date.now(); syncBusy = true; setSync('pulling');
   try {
     const j = await api('load'); const remote = j.data && j.data.Meta ? fromSheets(j.data) : null;
-    if (!remote) { await pushRemote(); if (announce) toast('Connected — your sheet is set up.'); return; }
-    // First time this device connects to a sheet that already has data: ask, never overwrite silently.
-    if (!L.lastSync && !S.meta.updatedAt) { S = normalize(remote); saveState(); _scKey = ''; L.lastSync = Date.now(); saveLocal(); setSync('synced'); closeModal(); render(); toast('Connected — your habits and tasks are loaded.'); return; }
-    if (!L.lastSync && remote.meta.updatedAt !== S.meta.updatedAt) {
-      const takeSheet = confirm(`Your Google Sheet already has data (${remote.habits.length} habits, ${remote.tasks.length} tasks, ${Object.keys(remote.days).length} days logged).\n\nOK = load the sheet's data onto this device (replaces what's here).\nCancel = keep this device's data and overwrite the sheet.`);
-      if (takeSheet) { S = normalize(remote); saveState(); _scKey = ''; L.lastSync = Date.now(); saveLocal(); setSync('synced'); closeModal(); render(); toast('Loaded your data from Google Sheets.'); }
-      else { await pushRemote(); toast('This device’s data is now in your sheet.'); }
+    syncBusy = false;
+    if (!remote || isEmptyState(remote)) {                              // sheet is empty → fill it from here (if we have anything)
+      if (!isEmptyState(S)) { await pushRemote({ force: true }); if (announce) toast('Connected — your data is now in your sheet.'); }
+      else { L.lastSync = Date.now(); saveLocal(); setSync('synced'); if (announce) toast('Connected. Your sheet is empty so far.'); }
       return;
     }
-    if (remote.meta.updatedAt > S.meta.updatedAt) { S = normalize(remote); saveState(); L.lastSync = Date.now(); saveLocal(); setSync('synced'); render(); toast('Loaded your latest data from Google Sheets.'); }
-    else if (remote.meta.updatedAt < S.meta.updatedAt) await pushRemote();
-    else { L.lastSync = Date.now(); saveLocal(); setSync('synced'); if (announce) toast('Connected — everything is up to date.'); }
-  } catch (e) { console.warn(e); setSync('error'); if (announce) toast('Could not reach your sheet: ' + e.message, 5000); }
+    if (isEmptyState(S)) return adoptState(remote, 'Connected — your habits and tasks are loaded.'), closeModal();
+    if (remote.meta.updatedAt === S.meta.updatedAt) { L.remoteAt = remote.meta.updatedAt; L.lastSync = Date.now(); L.dirty = false; saveLocal(); setSync('synced'); if (announce) toast('Everything is up to date.'); return; }
+    const firstTime = !L.lastSync || typeof L.remoteAt !== 'number';
+    const sheetChanged = remote.meta.updatedAt !== L.remoteAt;
+    if (firstTime) return askSync(remote, 'first');
+    if (!sheetChanged) { if (L.dirty || S.meta.updatedAt > remote.meta.updatedAt) await pushRemote(); else setSync('synced'); return; }
+    // the sheet was changed by another device
+    if (!L.dirty) {
+      if (remoteLooksSmaller(remote)) return askSync(remote, 'smaller');
+      return adoptState(remote, 'Updated with changes from your other device.');
+    }
+    // both sides changed → combine, then save the combined copy
+    S = mergeStates(S, remote); S.meta.updatedAt = Date.now(); saveState(); _scKey = ''; L.remoteAt = remote.meta.updatedAt; saveLocal(); render();
+    await pushRemote({ retried: true });
+  } catch (e) { syncBusy = false; console.warn(e); setSync('error'); if (announce) toast('Could not reach your sheet: ' + e.message, 5000); }
+}
+let pendingRemote = null;
+function askSync(remote, why) { pendingRemote = remote; syncHold = true; clearTimeout(syncTimer); setSync('waiting'); openModal(() => syncChoiceModal(why)); }
+function syncChoiceModal(why) {
+  const r = pendingRemote; if (!r) return '';
+  return `<div class="mhead"><h2 class="grow">Which data should we keep?</h2></div><div class="stack">
+    <p class="small">${why === 'first' ? 'This device and your Google Sheet both have data, and they don’t match yet.' : 'Your Google Sheet has <b>less</b> data than this device — it may have been overwritten by another tab or device.'} Nothing has been changed yet.</p>
+    <div class="card" style="box-shadow:none"><div class="set-row"><div class="grow"><b>This device</b><div class="muted tiny">${sizeOf(S)}</div></div></div><div class="set-row"><div class="grow"><b>Google Sheet</b><div class="muted tiny">${sizeOf(r)}</div></div></div></div>
+    <button class="btn block" data-act="syncChoose" data-v="merge">Combine both (nothing is lost)</button>
+    <button class="btn ghost block" data-act="syncChoose" data-v="remote">Use the Google Sheet’s data on this device</button>
+    <button class="btn danger block" data-act="syncChoose" data-v="local">Replace the Google Sheet with this device’s data</button>
+    <p class="help" style="margin:0">Not sure? Choose <b>Combine both</b>. If you combine the example setup with your real data you can delete the example habits afterwards.</p></div>`;
+}
+async function resolveSync(choice) {
+  const r = pendingRemote; if (!r) return closeModal();
+  if (choice === 'local' && !confirm(`Replace your Google Sheet (${sizeOf(r)}) with this device’s data (${sizeOf(S)})?`)) return;
+  pendingRemote = null; syncHold = false; closeModal();
+  if (choice === 'remote') return adoptState(r, 'Loaded your data from Google Sheets.');
+  if (choice === 'merge') { S = mergeStates(S, r); S.meta.updatedAt = Date.now(); saveState(); _scKey = ''; L.remoteAt = r.meta.updatedAt; L.dirty = true; saveLocal(); render(); await pushRemote({ retried: true }); toast('Combined — everything from both is kept.'); return; }
+  L.remoteAt = r.meta.updatedAt; L.dirty = true; saveLocal(); await pushRemote({ force: true }); toast('Your sheet now matches this device.');
 }
 function toSheets() {
   const out = {}; const put = (name, headers, rows) => out[name] = { headers, rows: rows.map(r => headers.map(h => r[h] === undefined || r[h] === null ? '' : r[h])) };
@@ -946,14 +1030,15 @@ const ACT = {
   backup: () => download(`habitude-backup-${todayStr()}.json`, JSON.stringify({ format: 'habitude-backup', ...S }), 'application/json'),
   restore: () => $('#fileBackup').click(),
   resetAll: () => { if (!confirm('Erase all habits, tasks, templates and history on this device?')) return; if (!confirm('Really erase everything? (Your Google Sheet keeps its copy until the next sync.)')) return;
-    S = defaultState(); saveState(); _scKey = ''; V.date = todayStr(); render(); openModal(welcomeModal); },
+    S = defaultState(); saveState(); _scKey = ''; L.dirty = false; delete L.remoteAt; saveLocal(); V.date = todayStr(); render(); openModal(welcomeModal); },
+  syncChoose: el => resolveSync(el.dataset.v),
   openConnect: () => openModal(connectModal),
   backToWelcome: () => openModal(welcomeModal),
   copySetupCode: async () => { const code = 'HBT1:' + btoa(unescape(encodeURIComponent(JSON.stringify({ u: L.scriptUrl, k: L.appKey }))));
     try { await navigator.clipboard.writeText(code); toast('Setup code copied — paste it into the other copy of the app.', 3500); }
     catch { prompt('Copy this setup code:', code); } },
-  seedExample: () => { S = exampleState(); S.meta.updatedAt = Date.now(); saveState(); scheduleSync(); closeModal(); render(); },
-  startBlank: () => { closeModal(); S.meta.updatedAt = Date.now(); saveState(); render(); },
+  seedExample: () => { S = exampleState(); S.meta.updatedAt = Date.now(); saveState(); closeModal(); render(); if (L.scriptUrl) pullRemote({ force: true }); },
+  startBlank: () => { closeModal(); render(); },
   expAll: el => { const v = el.dataset.v === '1'; DATASETS.forEach(([id]) => exportModal.st.ids[id] = v); rerenderModal(); },
   exportFull: el => openModal(() => exportModal(el.dataset.kind, false)),
   exportPartial: el => openModal(() => exportModal(el.dataset.kind, true)),
@@ -965,7 +1050,7 @@ const CH = {
   taskGroup: el => { V.taskGroup = el.value; render(); },
   q: el => { V.q[el.dataset.k] = el.value; render(); },
   setting: el => commit(s => { s.settings[el.dataset.k] = +el.value; }),
-  localSet: el => { L[el.dataset.k] = el.value.trim(); if (el.dataset.k !== 'claudeKey') L.lastSync = 0; saveLocal(); queueRender(); if (el.dataset.k === 'scriptUrl' && L.scriptUrl && L.appKey) pullRemote({ force: true, announce: true }); },
+  localSet: el => { L[el.dataset.k] = el.value.trim(); if (el.dataset.k !== 'claudeKey') { L.lastSync = 0; delete L.remoteAt; } saveLocal(); queueRender(); if (el.dataset.k === 'scriptUrl' && L.scriptUrl && L.appKey) pullRemote({ force: true, announce: true }); },
   tplField: el => commit(s => { const t = s.templates.find(x => x.id === el.dataset.id); t[el.dataset.k] = el.dataset.k === 'name' ? (el.value.trim() || 'Untitled day') : el.value; }),
   tplToggle: el => commit(s => { const t = s.templates.find(x => x.id === el.dataset.id); t[el.dataset.k] = el.checked; }),
   habitField: el => commit(s => { const h = s.habits.find(x => x.id === el.dataset.id); h[el.dataset.k] = el.dataset.k === 'name' ? (el.value.trim() || 'Untitled habit') : el.value; }),
@@ -984,7 +1069,7 @@ const SUB = {
   connectSheet: f => { const fromCode = parseSetupCode(f.code.value); const url = fromCode ? fromCode.u : f.url.value.trim(); const key = fromCode ? fromCode.k : f.key.value.trim();
     if (f.code.value.trim() && !fromCode) return toast("That setup code doesn't look right — try copying it again.");
     if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(url) || !key) return toast('Paste a setup code, or both the web app URL and key.');
-    L.scriptUrl = url; L.appKey = key; L.lastSync = 0; saveLocal(); toast('Connecting…'); pullRemote({ force: true, announce: true }); },
+    L.scriptUrl = url; L.appKey = key; L.lastSync = 0; delete L.remoteAt; saveLocal(); toast('Connecting…'); pullRemote({ force: true, announce: true }); },
   quickTask: f => { const title = f.title.value.trim(); if (!title) return; const coins = +f.coins.value; const id = uid('tk');
     commit(s => { s.tasks.push({ id, title, groupId: '', due: '', priority: 2, notes: '', status: 'open', createdAt: Date.now(), closedAt: '' }); ensureDay(s, V.date).tasks.push({ taskId: id, coins, done: false }); }); },
   newTask: f => { const fd = new FormData(f); const title = String(fd.get('title')).trim(); if (!title) return;
@@ -1069,14 +1154,14 @@ function exampleState() {
 /* ---------------- global listeners ---------------- */
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]');
-  if (!el) { if (e.target.id === 'modal') closeModal(); return; }
+  if (!el) { if (e.target.id === 'modal' && !syncHold) closeModal(); return; }
   if (el.disabled) return; const fn = ACT[el.dataset.act]; if (!fn) return;
   if (el.type !== 'checkbox') e.preventDefault(); fn(el, e);
 });
 document.addEventListener('change', e => { const el = e.target.closest('[data-ch]'); if (el && CH[el.dataset.ch]) CH[el.dataset.ch](el, e); });
 document.addEventListener('input', e => { const el = e.target.closest('[data-in]'); if (el && IN[el.dataset.in]) IN[el.dataset.in](el, e); });
 document.addEventListener('submit', e => { const f = e.target.closest('form[data-submit]'); if (f && SUB[f.dataset.submit]) { e.preventDefault(); SUB[f.dataset.submit](f); } });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && modalFn) closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && modalFn && !syncHold) closeModal(); });
 $('#fileSkin').addEventListener('change', async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
   try { const o = JSON.parse(await f.text()); const sk = sanitizeSkin({ ...(o.skin || o), id: uid('sk') }); if (!sk) throw 0;
@@ -1093,6 +1178,12 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
   else if (syncState === 'pending') pushRemote(); });
 window.addEventListener('pagehide', () => { if (syncState === 'pending') pushRemote(); });
 
+window.addEventListener('storage', e => {
+  try {
+    if (e.key === STORE && e.newValue) { S = normalize(JSON.parse(e.newValue)); _scKey = ''; queueRender(); }
+    if (e.key === LOCAL && e.newValue) { const o = JSON.parse(e.newValue); L = { ...L, ...o }; updateSyncUI(); }
+  } catch {}
+});
 const PAGES = { day: pageDay, tasks: pageTasks, progress: pageProgress, settings: pageSettings };
 render();
 if (FIRST_RUN) openModal(welcomeModal);
